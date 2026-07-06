@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:17.0
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: indexing_demo
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: [
+      "postgres",
+      "-c", "log_min_duration_statement=5",
+      "-c", "log_statement=none",
+      "-c", "shared_preload_libraries=auto_explain",
+      "-c", "auto_explain.log_min_duration=5",
+      "-c", "auto_explain.log_analyze=on",
+      "-c", "auto_explain.log_buffers=on",
+      "-c", "auto_explain.log_timing=on"
+    ]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  load_tester:
+    build:
+      context: ./load_tester
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy

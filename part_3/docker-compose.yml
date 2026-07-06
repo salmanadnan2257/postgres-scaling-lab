@@ -1,0 +1,82 @@
+services:
+  primary:
+    image: postgres:17.0
+    container_name: pg_primary
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: events_db
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./primary.conf:/etc/postgresql/postgresql.conf
+      - ./pg_hba.conf:/etc/postgresql/pg_hba.conf
+      - primary_data:/var/lib/postgresql/data
+    ports:
+      - "5436:5432"
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  replica1:
+    image: postgres:17.0
+    container_name: pg_replica1
+    user: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: events_db
+      PGPASSFILE: /var/lib/postgresql/.pgpass
+    volumes:
+      - ./replica1.conf:/etc/postgresql/postgresql.conf
+      - replica1_data:/var/lib/postgresql/data
+    ports:
+      - "5437:5432"
+    command: |
+      bash -c '
+      echo "primary:5432:*:$$POSTGRES_USER:$$POSTGRES_PASSWORD" > /var/lib/postgresql/.pgpass
+      chmod 600 /var/lib/postgresql/.pgpass
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        echo "Taking base backup from primary..."
+        pg_basebackup -h primary -U postgres -p 5432 -D /var/lib/postgresql/data -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+      fi
+      postgres -c config_file=/etc/postgresql/postgresql.conf'
+    depends_on:
+      primary:
+        condition: service_healthy
+
+  replica2:
+    image: postgres:17.0
+    container_name: pg_replica2
+    user: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: events_db
+      PGPASSFILE: /var/lib/postgresql/.pgpass
+    volumes:
+      - ./replica2.conf:/etc/postgresql/postgresql.conf
+      - replica2_data:/var/lib/postgresql/data
+    ports:
+      - "5438:5432"
+    command: |
+      bash -c '
+      echo "primary:5432:*:$$POSTGRES_USER:$$POSTGRES_PASSWORD" > /var/lib/postgresql/.pgpass
+      chmod 600 /var/lib/postgresql/.pgpass
+      if [ ! -s /var/lib/postgresql/data/PG_VERSION ]; then
+        echo "Taking base backup from primary..."
+        pg_basebackup -h primary -U postgres -p 5432 -D /var/lib/postgresql/data -Fp -Xs -P -R
+        chmod 700 /var/lib/postgresql/data
+      fi
+      postgres -c config_file=/etc/postgresql/postgresql.conf'
+    depends_on:
+      primary:
+        condition: service_healthy
+
+volumes:
+  primary_data:
+  replica1_data:
+  replica2_data:
