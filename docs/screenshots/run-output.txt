@@ -1,0 +1,213 @@
+Part 1, the email lookup: what the index actually buys.
+Real stdout, captured 2026-07-14. Nothing here is retyped or rounded by hand.
+
+  Query    SELECT * FROM users WHERE email = 'user50000@example.com';
+  Schema   part_1/init.sql, unmodified (100k users, 500k orders, no indexes)
+  Index    part_1/solution.sql, first statement (idx_users_email, B-tree, text_pattern_ops)
+  Server   PostgreSQL 18.4 (Ubuntu 18.4-1.pgdg24.04+1), stock initdb settings,
+           shared_buffers 128MB, scratch cluster on port 55432, NVMe SSD
+  Machine  Intel Core i7-1185G7, 8 threads, 31 GiB RAM, Ubuntu 24.04.4, kernel 6.8.0
+  Note     This is a bare-metal local cluster, NOT the course Docker stack. The
+           35 ms to 0.5 ms figures in the README came from the original course run
+           on PostgreSQL 17 in Docker, on a different machine. Both are real; they
+           are not the same measurement and should not be compared to each other.
+
+$ psql -d indexing_demo -f part_1/init.sql
+CREATE EXTENSION
+CREATE TABLE
+CREATE TABLE
+INSERT 0 100000
+INSERT 0 500000
+
+$ psql -d indexing_demo -c '\d users'      # no index on email yet
+                                        Table "public.users"
+   Column   |            Type             | Collation | Nullable |              Default
+------------+-----------------------------+-----------+----------+-----------------------------------
+ id         | integer                     |           | not null | nextval('users_id_seq'::regclass)
+ email      | character varying(255)      |           |          |
+ full_name  | character varying(255)      |           |          |
+ status     | character varying(20)       |           |          |
+ metadata   | jsonb                       |           |          |
+ created_at | timestamp without time zone |           |          | CURRENT_TIMESTAMP
+Indexes:
+    "users_pkey" PRIMARY KEY, btree (id)
+
+
+================================================================================
+BEFORE THE INDEX
+================================================================================
+
+$ pg_ctl restart      # empties shared_buffers: the next scan is a true first touch
+$ psql -d indexing_demo -c "EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user50000@example.com';"
+                                                QUERY PLAN
+-----------------------------------------------------------------------------------------------------------
+ Seq Scan on users  (cost=0.00..2712.22 rows=87 width=1134) (actual time=23.950..62.589 rows=1.00 loops=1)
+   Filter: ((email)::text = 'user50000@example.com'::text)
+   Rows Removed by Filter: 99999
+   Buffers: shared read=2494 dirtied=2494
+ Planning:
+   Buffers: shared hit=46 read=19
+ Planning Time: 0.622 ms
+ Execution Time: 62.647 ms
+(8 rows)
+
+
+It reads all 2,494 blocks of the table and throws away 99,999 of the 100,000 rows.
+The same query again, now that the table is cached (this is the steady state):
+
+                                                QUERY PLAN
+----------------------------------------------------------------------------------------------------------
+ Seq Scan on users  (cost=0.00..2712.22 rows=87 width=1134) (actual time=9.037..18.765 rows=1.00 loops=1)
+   Filter: ((email)::text = 'user50000@example.com'::text)
+   Rows Removed by Filter: 99999
+   Buffers: shared hit=2494
+ Planning:
+   Buffers: shared hit=70
+ Planning Time: 0.440 ms
+ Execution Time: 18.830 ms
+(8 rows)
+
+
+================================================================================
+CREATE THE INDEX   (the first statement of part_1/solution.sql)
+================================================================================
+
+$ psql -d indexing_demo -c "CREATE INDEX idx_users_email ON users(email text_pattern_ops);"
+CREATE INDEX
+
+================================================================================
+AFTER THE INDEX   (identical query, nothing else changed)
+================================================================================
+
+$ pg_ctl restart      # cold again: neither the table nor the new index is cached
+$ psql -d indexing_demo -c "EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user50000@example.com';"
+                                                          QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on users  (cost=16.29..1259.51 rows=500 width=1134) (actual time=0.176..0.177 rows=1.00 loops=1)
+   Recheck Cond: ((email)::text = 'user50000@example.com'::text)
+   Heap Blocks: exact=1
+   Buffers: shared read=4
+   ->  Bitmap Index Scan on idx_users_email  (cost=0.00..16.17 rows=500 width=0) (actual time=0.043..0.044 rows=1.00 loops=1)
+         Index Cond: ((email)::text = 'user50000@example.com'::text)
+         Index Searches: 1
+         Buffers: shared read=3
+ Planning:
+   Buffers: shared hit=63 read=20 dirtied=1
+ Planning Time: 0.575 ms
+ Execution Time: 0.240 ms
+(12 rows)
+
+
+Four blocks instead of 2,494. The same query again, cached (steady state):
+
+                                                          QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on users  (cost=16.29..1259.51 rows=500 width=1134) (actual time=0.023..0.025 rows=1.00 loops=1)
+   Recheck Cond: ((email)::text = 'user50000@example.com'::text)
+   Heap Blocks: exact=1
+   Buffers: shared hit=4
+   ->  Bitmap Index Scan on idx_users_email  (cost=0.00..16.17 rows=500 width=0) (actual time=0.012..0.013 rows=1.00 loops=1)
+         Index Cond: ((email)::text = 'user50000@example.com'::text)
+         Index Searches: 1
+         Buffers: shared hit=3
+ Planning:
+   Buffers: shared hit=88
+ Planning Time: 0.497 ms
+ Execution Time: 0.106 ms
+(12 rows)
+
+
+================================================================================
+REPEATABILITY
+================================================================================
+
+Wall-clock timing on this laptop is noisy, so every figure above is repeated here.
+Blocks read are not noisy: they are 2,494 before and 4 after, every single time.
+
+Warm sequential scan, no index, 8 consecutive runs:
+  18.579 ms
+  19.208 ms
+  19.583 ms
+  19.943 ms
+  20.551 ms
+  16.725 ms
+  21.547 ms
+  15.314 ms
+
+Warm index scan, 8 consecutive runs:
+  0.105 ms
+  0.100 ms
+  0.099 ms
+  0.099 ms
+  0.116 ms
+  0.112 ms
+  0.077 ms
+  0.097 ms
+
+Cold index scan, 4 trials (pg_ctl restart before each):
+  0.262 ms
+  0.245 ms
+  0.207 ms
+  0.252 ms
+
+Cold FIRST-TOUCH sequential scan, 4 trials (drop the database, reload
+part_1/init.sql, restart, scan once). This is the one measurement here that
+does not reproduce:
+  trial 1: 50.822 ms
+  trial 2: 27.310 ms
+  trial 3: 23.829 ms
+  trial 4: 28.579 ms
+
+That first scan is not just reading: it is also setting a hint bit on all 100,000
+rows and writing those 2,494 dirtied blocks back out. That write-back is what the
+spread is made of, and it happens once in the table's life, not on every query.
+Repeating the whole load-and-scan cycle across separate sessions on this same
+machine produced values from 19 ms to 140 ms for that first scan. A single sample
+of it is not a benchmark, which is why the figure quoted on the project page is
+the steady state below and not the first touch.
+
+================================================================================
+WHAT WAS IN THE TABLE
+================================================================================
+
+$ psql -d indexing_demo -c 'SELECT count(*) FROM users;' -c 'SELECT count(*) FROM orders;'
+ users
+--------
+ 100000
+(1 row)
+
+ orders
+--------
+ 500000
+(1 row)
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+What is stable and worth quoting, from the runs above:
+
+  Blocks read      2,494  ->  4          deterministic, identical on every run
+  Rows filtered   99,999  ->  0          the scan stops touching rows it cannot use
+  Plan          Seq Scan  ->  Bitmap Index Scan + Bitmap Heap Scan
+  Steady state  15.3 to 21.5 ms  ->  0.077 to 0.116 ms     (8 runs each, warm)
+  Cold                    ->  0.207 to 0.262 ms            (4 trials, warm-free)
+
+The honest headline is the block count, not the millisecond count. Timing moves
+with cache warmth and with whatever else the laptop is doing; blocks read do not.
+That is the same conclusion part 2 reached from EXPLAIN (BUFFERS), and it is why
+this file reports both instead of one flattering number.
+
+How to reproduce, without Docker and without root:
+
+  initdb -D "$PGDATA"
+  pg_ctl -D "$PGDATA" -o "-p 55432 -c listen_addresses=127.0.0.1" -w start
+  createdb -h 127.0.0.1 -p 55432 indexing_demo
+  psql -h 127.0.0.1 -p 55432 -d indexing_demo -f part_1/init.sql
+  psql -h 127.0.0.1 -p 55432 -d indexing_demo \
+    -c "EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user50000@example.com';"
+  psql -h 127.0.0.1 -p 55432 -d indexing_demo \
+    -c "CREATE INDEX idx_users_email ON users(email text_pattern_ops);"
+  psql -h 127.0.0.1 -p 55432 -d indexing_demo \
+    -c "EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user50000@example.com';"

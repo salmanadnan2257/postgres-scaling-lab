@@ -82,7 +82,9 @@ The part 3 app reads `PRIMARY_DSN` and `REPLICA_DSNS` (comma-separated) from the
 
 ## Verification status
 
-Docker was not available on the machine used for the latest revision, so the compose stacks were not re-run there. What was verified instead: every SQL file executes cleanly against PostgreSQL 18, the part 3 test suite passes 5/5 against a local PostgreSQL (all DSNs pointed at one server), and all three compose files pass `docker compose config`. The benchmark numbers above come from the original Docker runs during the course.
+Docker was not available on the machine used for the latest revision, so the compose stacks were not re-run there. What was verified instead: every SQL file executes cleanly against PostgreSQL 18, the part 3 test suite passes 5/5 against a local PostgreSQL (all DSNs pointed at one server), and all three compose files pass `docker compose config`. The benchmark table above comes from the original Docker runs during the course (PostgreSQL 17), and has not been re-measured since.
+
+The part 1 email lookup **was** re-measured, on a scratch local PostgreSQL 18.4 cluster loading this repo's own `part_1/init.sql` (100k users, 500k orders) and its own `idx_users_email`. Full stdout is saved in [docs/screenshots/run-output.txt](docs/screenshots/run-output.txt), and the screenshot beside it is that same run. The result: the sequential scan reads all 2,494 blocks of `users` and discards 99,999 of the 100,000 rows; with the index it reads 4 blocks. Warm, the query goes from about 19ms to about 0.1ms. Those block counts are identical on every run; the milliseconds are not, so the block count is the figure worth quoting. The first-ever scan of a freshly loaded table is much slower and very unstable (19ms to 140ms across trials) because it is also setting hint bits on every row and writing those blocks back out; a single sample of it is not a benchmark. These numbers are a different machine and a different PostgreSQL from the 35ms/0.5ms in the table, and are not directly comparable to it.
 
 ## Challenges
 
