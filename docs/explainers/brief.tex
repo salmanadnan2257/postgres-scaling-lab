@@ -1,0 +1,641 @@
+% explainer-source-hash: fd52fbd1332a6f252c1b0b278f92083516211a41f7cbdb91b9b923b25ad25172
+% explainer-source-commit: 70588341e24abbcb1fc87aafde53158d490f083d
+% explainer-generated: 2026-07-16
+% Regenerate with /explain-all (see WIRING.md). Do not edit this stamp by hand:
+% it is how the toolchain knows whether this document still matches the code.
+\documentclass[11pt,a4paper]{article}
+\input{preamble}
+\begin{document}
+
+\begin{center}
+{\LARGE\bfseries\color{inkblue} PostgreSQL Scaling Lab\par}
+\vspace{0.3cm}
+{\large\color{accent} Brief\par}
+\vspace{0.5cm}
+\begin{minipage}{0.9\textwidth}
+\small
+Three techniques for making one relational database do more, in escalating order of
+cost: index it, partition it, replicate it. What each one buys, what each one costs,
+and which of this project's published numbers survive a re-measurement.
+
+A companion Deep Dive covers the same ground exhaustively, with every term defined at
+first use. This document assumes you can read a \code{SELECT} and want the shape of the
+thing, the trade-offs, and the honest state of the evidence.
+\end{minipage}
+\end{center}
+
+\vspace{0.4cm}
+\hrule
+\vspace{0.6cm}
+
+% =====================================================================
+\section{The premise}
+
+A company runs on PostgreSQL. Queries are slowing down. The CTO has heard NoSQL is
+``infinitely scalable'' and wants to migrate. The counter-argument this project makes is
+not rhetorical: it works through what the standard toolbox actually delivers, measures
+it, and reports the cases where it does not help.
+
+Three parts, three independent Docker Compose stacks, run one at a time:
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[node distance=5mm]
+  \node[box, minimum width=3.6cm, minimum height=1.5cm] (p1) {\textbf{1. Index}\\\scriptsize find slow queries,\\build the right index};
+  \node[box, minimum width=3.6cm, minimum height=1.5cm, right=1.6cm of p1] (p2) {\textbf{2. Partition}\\\scriptsize split a time-series table\\so queries touch one slice};
+  \node[box, minimum width=3.6cm, minimum height=1.5cm, right=1.6cm of p2] (p3) {\textbf{3. Replicate}\\\scriptsize two streaming copies,\\reads routed to them};
+  \draw[flow] (p1) -- (p2);
+  \draw[flow] (p2) -- (p3);
+
+  \node[lbl, below=3mm of p1, text width=3.8cm] {one server\\nothing structural changes};
+  \node[lbl, below=3mm of p2, text width=3.8cm] {one server\\the table's shape changes};
+  \node[lbl, below=3mm of p3, text width=3.8cm] {three servers\\a new class of bug};
+
+  \node[lbl, above=3mm of p1, text width=3.8cm] {cheapest};
+  \node[lbl, above=3mm of p3, text width=3.8cm] {most disruptive};
+  \draw[dflow, draw=warnred] ([yshift=1.1cm]p1.north west) -- node[lbl, midway, above] {increasing cost, increasing blast radius} ([yshift=1.1cm]p3.north east);
+\end{tikzpicture}}
+\end{figure}
+
+\begin{honest}{What is the author's, and what was handed to him}
+The assignment briefs, the \file{init.sql} schemas, the baseline app
+(\file{part\_3/app/app.py}), the test suite, and the prebuilt Go load generator are
+course-provided. The author's work is the three solution files, the entire part 3
+replication configuration, the routing app \file{solution.py}, and the analysis. The
+code volume is small; the reasoning is the deliverable. This is stated plainly in the
+project README, which is the right call.
+\end{honest}
+
+% =====================================================================
+\section{Part 1: indexing}
+
+\subsection{The mechanism}
+
+A table is a pile of 8~KB blocks in no particular order. With no index, finding one row
+means reading every block and discarding almost everything. An index is a separate
+sorted structure mapping values to row locations, so a lookup becomes a short descent
+instead of a full sweep.
+
+Measured on this project's own 100,000-row \code{users} table: \textbf{2,494 blocks
+$\rightarrow$ 4 blocks}, and 99,999 wasted row inspections $\rightarrow$ 0. That is the
+entire value proposition, and it is reproduced in
+\file{docs/screenshots/run-output.txt} and again independently while writing these
+documents.
+
+\subsection{The real lesson: an index is three decisions, not one}
+
+The transferable idea in part 1 is not ``add indexes''. It is that
+\code{CREATE INDEX} is a choice of column, index \emph{type}, and \emph{operator class},
+and getting the last one wrong builds an index the planner will never use.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.94\textwidth}{!}{
+\begin{tikzpicture}[node distance=8mm]
+  \node[box, minimum width=3.4cm] (a) {\code{col = value}\\\code{ORDER BY col}};
+  \node[box, minimum width=3.4cm, below=0.7cm of a] (b) {\code{col LIKE 'abc\%'}};
+  \node[box, minimum width=3.4cm, below=0.7cm of b] (c) {\code{col ILIKE '\%abc\%'}};
+  \node[box, minimum width=3.4cm, below=0.7cm of c] (d) {\code{jsonb @> '\{...\}'}};
+
+  \node[box, right=3.2cm of a, minimum width=5.4cm, draw=okgreen] (ra) {plain \textbf{B-tree}};
+  \node[box, right=3.2cm of b, minimum width=5.4cm, draw=okgreen] (rb) {B-tree, \textbf{text\_pattern\_ops}};
+  \node[box, right=3.2cm of c, minimum width=5.4cm, draw=okgreen] (rc) {\textbf{GIN}, \textbf{gin\_trgm\_ops} (\code{pg\_trgm})};
+  \node[box, right=3.2cm of d, minimum width=5.4cm, draw=okgreen] (rd) {\textbf{GIN} on the column};
+
+  \draw[flow] (a) -- (ra); \draw[flow] (b) -- (rb);
+  \draw[flow] (c) -- (rc); \draw[flow] (d) -- (rd);
+  \node[lbl, below=4mm of rd, text width=10cm] {A plain B-tree answers only the first row. The other three are different
+  structures answering different questions, not tuning knobs.};
+\end{tikzpicture}}
+\caption{The decision \file{part\_1/solution.sql} encodes in seven lines.}
+\end{figure}
+
+Why each one is forced:
+
+\begin{itemize}
+  \item \textbf{\code{text\_pattern\_ops}}: a default text B-tree sorts by locale rules,
+    so PostgreSQL cannot prove that everything starting \code{'user1'} is contiguous in
+    the index, and refuses to use it for \code{LIKE 'user1\%'}. Sorting by raw character
+    value restores that guarantee. The trade: the index can no longer serve
+    \code{ORDER BY} in locale order. Here nothing needs that, so it is a good trade;
+    the project does not mention that it is a trade at all.
+  \item \textbf{Trigram GIN}: for \code{'\%abc\%'} the match can start anywhere, so no
+    sort order helps. \code{pg\_trgm} chops strings into three-character slices and GIN
+    maps each slice to the many rows containing it. It returns \emph{candidates} that
+    must be re-checked, which is exactly why it disappoints (310~ms $\rightarrow$ 180~ms
+    in the project's own reporting, correctly explained there).
+  \item \textbf{JSONB GIN}: same structure, indexing every key and value path so
+    \code{@>} containment can be answered from the index.
+\end{itemize}
+
+\subsection{Where the reporting does not survive contact}
+
+All of the following were checked by loading this repository's own \file{init.sql} and
+\file{solution.sql} into a real PostgreSQL and reading the plans.
+
+\begin{honest}{The load generator is not a black box}
+The README lists it as a challenge: prebuilt Go binaries, no source, ``I could not
+change the query mix or read what it was doing.'' The response (turn on
+\code{auto\_explain} and make the database report its own plans) is excellent and right
+regardless. But Go embeds string literals in the binary, and one command recovers the
+full 14-query mix:
+
+\begin{lstlisting}
+grep -aoE "SELECT [ -~]{15,200}" load_tester_amd64 | grep -iE "FROM (users|orders)"
+\end{lstlisting}
+
+``Could not change'' stands. ``Could not read'' does not. This matters because knowing
+the mix lets you say which index serves which real query, and doing that turns up two
+claims the real queries contradict.
+\end{honest}
+
+\begin{honest}{The status index is credited to a query that cannot use it}
+\file{INDEXING\_ANSWERS.md} calls \code{status} ``low selectivity (only 2 values)'' and
+credits \code{idx\_users\_status} with a 30\% gain. Three problems, all measured:
+
+\begin{itemize}
+  \item Distinct-value count is not selectivity. The real split is \textbf{99,000
+    active to 1,000 inactive}. \code{'inactive'} is a 1\% predicate and the index is
+    excellent for it (59~ms $\rightarrow$ 10.6~ms). \code{'active'} is 99\% and nothing
+    can help.
+  \item The load tester's only status filter is \code{status = 'active'}, the 99\%
+    case. Measured: the planner correctly ignores the index and scans sequentially. It
+    cannot be responsible for the claimed gain.
+  \item The index \emph{does} earn its keep, via a query the notes never mention:
+    \code{SELECT status, COUNT(*) ... GROUP BY status} is served by an index-only scan
+    over 696~KB instead of an 85~MB heap.
+\end{itemize}
+
+Keep the index, replace the story.
+\end{honest}
+
+\begin{honest}{``Indexes don't help \code{COUNT(*)}'' is wrong, and this project disproves it}
+The visibility argument in the notes is right (PostgreSQL must check each row's
+visibility, so there is no free counter). The conclusion is not. Measured:
+\code{SELECT COUNT(*) FROM users} runs as an \textbf{Index Only Scan on
+\code{idx\_users\_created\_desc}} touching \textbf{87 blocks}; with index-only scans
+disabled it sequentially scans \textbf{2,494}. PostgreSQL walks the smallest covering
+index rather than the heap, because counting needs to visit rows, not read columns. The
+author built that index for sorting and accelerated \code{COUNT(*)} by roughly 29x
+without noticing.
+\end{honest}
+
+\begin{honest}{An index can lose, and here one does}
+JSONB containment, re-measured at two selectivities on this project's data:
+
+\begin{center}\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+\textbf{Predicate matches} & \textbf{Without GIN} & \textbf{With GIN} & \\
+\midrule
+50,000 rows (50\%) & 220~ms & 299~ms & \textbf{index loses} \\
+16,666 rows (17\%) & 148~ms & 82~ms & index wins \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+An index is a bet that most rows are irrelevant. At 50\% the bet loses: you pay for the
+index descent and visit half the heap anyway, in random order, when an ordered sweep was
+cheaper. The planner still \emph{chose} the index in the 50\% case and lost, which is a
+genuine misestimate on a JSONB column where statistics are weak. Worth being able to say
+out loud.
+
+The real load-tester JSONB query is worse: it pairs \code{@>} with
+\code{metadata->>'last\_login' > '2023-01-01'}, and only the containment half is
+indexable. Measured: GIN produces 50,000 candidates, the second filter discards all but
+646.
+\end{honest}
+
+\begin{honest}{The slowest real query is not fixable by any of the seven indexes}
+\code{SELECT DISTINCT u.* FROM users u JOIN orders o ON u.id = o.user\_id WHERE
+u.full\_name ILIKE '\%User\%' AND o.amount > 500} measures \textbf{2,932~ms} with every
+index in place. Neither the trigram index nor the amount index is used, and correctly so:
+the predicates match all 100,000 users and half the 500,000 orders. The assignment's own
+brief anticipates this (``consider if some queries are naturally slow''). This one is.
+\emph{(Inferred: this is very likely the query behind the README's ``4,500ms $\rightarrow$
+1,800ms'' row; the shape and magnitude match, but the README does not name it.)}
+\end{honest}
+
+Every one of the seven indexes is used by at least one real query, so the index set as a
+whole is justified. What is not justified is some of the attribution.
+
+% =====================================================================
+\section{Part 2: partitioning}
+
+\subsection{The mechanism}
+
+Indexes make finding a row cheap; they do not make a table smaller. Partitioning splits
+one logical table into many physical ones by a rule on a column (here
+\code{event\_time}). Writes are routed automatically. On read, the planner proves which
+partitions cannot contain a match and skips them entirely. That is \textbf{partition
+pruning}, and it is the whole point.
+
+The strategy in \file{part\_2/solution.sql} is defensible: monthly partitions for cold
+2024 history, weekly partitions for hot recent data, plus a default catch-all. Coarse
+where it does not matter, fine where it does.
+
+\subsection{What reproduces, and what does not}
+
+\begin{keyidea}{The claim that survives}
+Pruning works and is visible in the plan: \code{Subplans Removed: 15}. Sixteen
+partitions, exactly one scanned (\code{events\_202403}) for a March query. This is
+reproducible and it is what partitioning actually buys.
+\end{keyidea}
+
+\begin{honest}{The 9,154 $\rightarrow$ 975 block headline does not reproduce}
+The README's flagship part 2 number is ``monthly analysis dropped from 9,154 buffer
+blocks read to 975''. Re-measured on this repository's own data with both tables freshly
+\code{VACUUM ANALYZE}d: \textbf{236 blocks $\rightarrow$ 791 blocks}. Partitioning read
+3.3x \emph{more}.
+
+Pruning is not at fault; it works. The \emph{baseline} is the issue.
+\file{init.sql} ships \code{idx\_events\_time\_type} on
+\code{(event\_time, event\_type)}, and the monthly query needs only those two columns.
+So a properly analyzed single table answers it with an \textbf{Index Only Scan} over 236
+narrow index blocks and never touches the heap. After partitioning, all of March
+\emph{is} the partition, so a sequential scan of its 788 wide heap blocks wins on cost.
+
+\emph{(Inferred: 9,154 is the same order as a full sequential scan of the \code{events}
+heap, measured here at 10,910 blocks, and 975 is close to the 788-block March partition
+plus its index. The most likely explanation is a baseline measured on a freshly started
+container before \code{ANALYZE} ran, leaving the planner without the statistics to pick
+the index-only scan. The number is probably a real reading of a real plan; it just
+compares a no-statistics baseline against a partitioned table rather than isolating
+partitioning.)}
+
+The narrower claim is stronger because it reproduces: \emph{sixteen partitions pruned to
+one}.
+\end{honest}
+
+\begin{honest}{The negative result is real; its stated reason belongs to a different query}
+The README says user-activity queries got 70\% slower ``because they filter on
+\code{user\_id}, not the partition key, so every partition gets probed.'' That mechanism
+is exactly right. It just is not the benchmarked query.
+
+\textbf{The benchmark row} (part 2, query 3) filters on
+\code{event\_time >= NOW() - INTERVAL '30 days'}, which \emph{is} the partition key.
+Re-measured: it did get slower (186~ms $\rightarrow$ 520~ms) and pruning did happen. It
+is slower because every recent row now sits in one default partition that gets
+sequentially scanned, plus runtime pruning overhead.
+
+\textbf{The query the explanation describes} is \code{get\_user\_activity} from part 3's
+\file{solution.py} (\code{WHERE user\_id = \%s}). Re-measured against the part 2 tables,
+it behaves precisely as claimed: \textbf{55 blocks in 1 bitmap scan} on the single table
+versus \textbf{80 blocks across 13 index scans}, one per partition, because nothing lets
+the planner prune.
+
+Both slowdowns are real and both are worth discussing. The labels are crossed. That is a
+one-sentence fix, but an interviewer reading \file{part\_2/README.md} would hit it.
+\end{honest}
+
+\begin{honest}{The migration silently duplicates ids, which is worse than the README says}
+The README notes that \code{INSERT INTO events\_partitioned SELECT * FROM events} never
+advances the sequence, ``so fresh inserts would collide''. Verified, and the reality is
+nastier:
+
+\begin{itemize}
+  \item \code{events} has a primary key. \code{events\_partitioned} has \textbf{none} at
+    all: PostgreSQL requires a partitioned table's primary key to include the partition
+    key, so \code{PRIMARY KEY (id)} is illegal and only
+    \code{PRIMARY KEY (id, event\_time)} was available. The migration quietly drops a
+    uniqueness guarantee.
+  \item Sequence after migration: \code{last\_value} = \textbf{1}, \code{max(id)} =
+    \textbf{600,000}.
+  \item So there is no collision, because a collision needs a constraint to violate.
+    An insert \textbf{silently succeeds with a duplicate}. Verified: the next insert got
+    \code{id = 1}, and \code{id = 1} then existed twice.
+\end{itemize}
+
+Silent is worse than loud. The fix needs \code{setval()} \emph{and} an explicit decision
+about the composite key.
+\end{honest}
+
+\begin{honest}{The interesting half of the strategy is currently inert}
+\file{solution.sql} hardcodes partitions for 2024 and for three weeks of November 2025.
+\file{init.sql} generates recent data relative to \code{NOW()}. They only align if you
+run the project in November 2025. Verified today: \code{events\_default} holds
+\textbf{100,000 rows} (every recent event), and the three weekly ``hot data''
+partitions hold \textbf{0 each}.
+
+The 2024 monthly pruning still works, so the headline mechanism is unaffected. But the
+mixed-granularity design, which is the part worth defending, demonstrates nothing when
+run today. The README already proposes the fix (compute boundaries from the data with a
+\code{DO} block, or use \code{pg\_partman}).
+
+Two smaller data bugs, both the course's: \file{part\_2/README.md} says recent data
+spans 7 days while the generator uses 14, and because it subtracts days then adds hours
+and minutes, \textbf{3,717 rows land in the future}.
+\end{honest}
+
+\begin{honest}{One benchmark measures nothing at all}
+Query 4 filters \code{user\_id = 12345}, but the generator produces ids 1 to 10,001.
+\textbf{That user does not exist.} Verified: 0 rows, before and after. This explains the
+``$\sim$0\%'' row in \file{PARTITIONING\_ANSWERS.md} innocently and completely, but it is
+reported as a result rather than recognised as vacuous.
+\end{honest}
+
+\begin{keyidea}{The honest headline for part 2}
+Partitioning did not make this workload faster. It made the search space smaller and the
+access pattern explicit, and it made one query class substantially worse. It is a
+reorganization, not a speedup, and it can lose to a well-chosen covering index on a
+single table. Here it does.
+\end{keyidea}
+
+% =====================================================================
+\section{Part 3: read replicas}
+
+\subsection{The mechanism}
+
+PostgreSQL writes every change to a sequential log (the WAL) before touching data, for
+crash safety. Replication reuses that: ship the log to another server, replay it, and
+you have an identical server. A replica with \code{hot\_standby = on} serves read-only
+queries while it replays.
+
+\begin{figure}[H]
+\centering
+\resizebox{0.94\textwidth}{!}{
+\begin{tikzpicture}[node distance=7mm]
+  \node[extbox, minimum width=3.4cm] (app) {\code{solution.py}};
+  \node[box, below=1.3cm of app, minimum width=3.0cm] (pri) {\textbf{primary} :5436};
+  \node[box, below left=1.5cm and 1.0cm of pri, minimum width=2.6cm] (r1) {replica1 :5437};
+  \node[box, below right=1.5cm and 1.0cm of pri, minimum width=2.6cm] (r2) {replica2 :5438};
+
+  \draw[flow, line width=1pt] (app) -- node[lbl,right] {writes} (pri);
+  \draw[dflow] (pri) -- node[lbl,left,pos=0.6] {WAL} (r1);
+  \draw[dflow] (pri) -- node[lbl,right,pos=0.6] {WAL} (r2);
+  \draw[flow, draw=okgreen] (app.west) to[out=180,in=150] node[lbl,left,pos=0.8] {reads\\\code{random.choice()}} (r1.west);
+  \draw[flow, draw=okgreen] (app.east) to[out=0,in=30] (r2.east);
+
+  \node[lbl, right=3mm of pri, text width=4.6cm, align=left] {\code{synchronous\_commit = off}\\\code{max\_wal\_senders = 10}\\physical replication slots};
+\end{tikzpicture}}
+\end{figure}
+
+Two pieces of the setup are genuinely well done and are the author's own work:
+
+\begin{itemize}
+  \item \textbf{Replication slots.} The primary promises not to recycle WAL a named
+    replica has not consumed. Without them, a replica that falls behind can return to
+    find the WAL it needed is gone and must be rebuilt from scratch. Adding them was the
+    right call.
+  \item \textbf{Self-bootstrapping replicas.} The compose command runs
+    \code{pg\_basebackup ... -R} guarded by \code{if [ ! -s .../PG\_VERSION ]}, so a
+    replica builds itself on first boot and skips it on every restart. \code{-R} writes
+    the standby configuration automatically, which is what makes the copy come up as a
+    replica rather than an independent server. It is idempotent and needs no manual step.
+\end{itemize}
+
+\subsection{The consequence the project handled well}
+
+Async replication means the primary confirms a commit without waiting for replicas. So a
+read routed to a replica moments after a write can miss the row. The author's framing:
+
+\begin{quote}\itshape
+``There is no way to route around this without either synchronous replication or
+read-your-writes logic in the app. I left it async and made the routing honest about
+it.''
+\end{quote}
+
+That is correct. The options really are: pay latency (sync), add complexity (pin a
+user's reads to the primary briefly after their write), or accept staleness and say so.
+Choosing the third and documenting it is a legitimate decision. Once reads can lag
+writes, consistency has moved into the application, and that coupling simply does not
+exist on one node.
+
+\subsection{Where part 3 is weakest}
+
+\begin{honest}{``The credential is no longer sitting in version control'' is false}
+The README's challenge narrative is that a checked-in \file{.pgpass} was removed and the
+credential is now generated at container boot from the environment. The change is real
+and \file{diff.patch} confirms it. But one \code{git grep} finds:
+
+\begin{lstlisting}
+part_3/replica1.conf:12:primary_conninfo = 'host=primary port=5432 user=postgres password=postgres application_name=replica1'
+part_3/replica2.conf:12:primary_conninfo = 'host=primary port=5432 user=postgres password=postgres application_name=replica2'
+\end{lstlisting}
+
+Removing \file{.pgpass} removed one copy and left two, in the same directory. And
+\code{primary\_conninfo} governs the \emph{ongoing streaming connection}, which is
+arguably the more important path than the one-off base backup that \file{.pgpass}
+served. The string is also in \file{.env.example} and \file{docs/EXPLANATION.md}.
+
+Nothing is at risk (the password is \code{postgres}, in a lab). But this is checkable in
+ten seconds. The true and still-good version: \emph{the file whose only purpose was to
+hold a credential is gone, and the base-backup path now takes it from the environment;
+the streaming path still has it inline and would need \code{primary\_conninfo} templated
+at boot the same way.}
+\end{honest}
+
+\begin{honest}{\file{pg\_hba.conf} is \code{trust} from \code{0.0.0.0/0}}
+\code{trust} means no password is checked at all: anyone who can open a TCP connection
+is the \code{postgres} superuser, from any address, and port 5436 is published to the
+host. Fine for a disposable lab, but it should be labelled deliberate rather than
+discovered.
+
+It also creates an internal inconsistency: because replication connections are trusted,
+\code{pg\_basebackup} never needed a password, so the entire \file{.pgpass} narrative is
+defending a door this file leaves open. \emph{(Inferred from what \code{trust} means and
+from \file{primary.conf} loading this file via \code{hba\_file}; not confirmed end to
+end, since Docker was unavailable.)}
+\end{honest}
+
+\begin{honest}{The tests pass 5/5 with replication completely dead. Verified.}
+This was tested, not argued. Writes were pointed at a real database; reads were pointed
+at a \emph{different, permanently empty} database that receives nothing, ever, which
+simulates totally broken replication. Result: \textbf{5 passed in 1.94s}, with the
+``replica'' holding \textbf{0 rows} throughout.
+
+Every meaningful assertion sits behind \code{if len(user\_activity) > 0:} or
+\code{if type1 in stats\_dict:}, which is false forever when replication is broken, so
+the body never runs. The tests that assert unconditionally only touch the primary.
+
+The suite proves the app can write to the primary and open a connection to something. It
+does not test replication. The tests are course-provided, the author already identified
+this in ``What I'd do differently'', and his proposed fix (poll until the row appears,
+with a timeout) is exactly right. Stating it first, with the experiment, is a far
+stronger position than ``5/5 passed''.
+\end{honest}
+
+The router's other limits are all self-reported and correct: a new connection per query
+(no pooling, and PostgreSQL forks a backend process per connection), and
+\code{random.choice()} with no health awareness, so a dead replica fails 50\% of reads
+rather than slowing them.
+
+% =====================================================================
+\section{Verification status}
+
+\begin{honest}{Docker was unavailable; nothing multi-node was confirmed}
+The three Compose stacks were not brought up while writing these documents. No container
+ran. So \textbf{nothing about the topology was verified end to end}: not
+\code{pg\_basebackup}, not WAL streaming, not \code{pg\_stat\_replication} showing two
+streaming replicas, not the slots, not \file{pg\_hba.conf} being loaded.
+
+Every number in the README's part 1 benchmark table (35~ms $\rightarrow$ 0.5~ms and the
+rest) belongs to the original course runs on PostgreSQL 17 in Docker, on another
+machine. They are \textbf{attributed to the README, not verified here}. Where the
+measurements below disagree with them, they are a \emph{different measurement} on
+different hardware, a different major version and a different date, not a correction.
+\end{honest}
+
+What was done: a scratch PostgreSQL 18.4 cluster, loading this repository's own SQL.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{@{}p{0.50\textwidth}p{0.42\textwidth}@{}}
+\toprule
+\textbf{Check} & \textbf{Result} \\
+\midrule
+\file{part\_1/init.sql} + \file{solution.sql} & loads; 7 indexes, 36.4~MB total \\
+All 14 recovered load-tester queries, planned & every index used by something \\
+\code{status} distribution & 99,000 / 1,000, not ``2 values'' \\
+\code{COUNT(*)} plan & Index Only Scan, 87 blocks vs 2,494 \\
+JSONB GIN at 50\% / 17\% selectivity & slower / faster \\
+\file{part\_2/init.sql} & 600,000 rows; 3,717 in the future \\
+Partition row placement & default: 100,000. Weekly: 0, 0, 0 \\
+Sequence after migration & \code{last\_value}=1 vs \code{max(id)}=600,000 \\
+Insert after migration & silent duplicate \code{id}=1 \\
+Primary key on \code{events\_partitioned} & none \\
+All four part 2 benchmarks & re-measured, both tables analyzed \\
+\code{user\_id}-only query & 55 blocks / 1 scan vs 80 blocks / 13 scans \\
+part 3 suite, all DSNs to one server & \textbf{5 passed} \\
+part 3 suite, ``replica'' permanently empty & \textbf{5 passed} (vacuously) \\
+\code{git grep} for credentials & 2 live hits in \file{replica*.conf} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Assessment}
+
+\subsection{The liabilities, worst first}
+
+\begin{enumerate}
+  \item ``The credential is no longer in version control'' is false; one \code{git grep}
+    disproves it.
+  \item The 9,154 $\rightarrow$ 975 headline does not reproduce (measured 236
+    $\rightarrow$ 791, i.e.\ worse). Requalify it to the pruning claim, which does.
+  \item The user-activity explanation is attached to the wrong query.
+  \item Migration silently duplicates ids; the partitioned table has no primary key.
+  \item The weekly ``hot data'' partitions are empty today.
+  \item The tests pass vacuously.
+  \item \code{idx\_users\_status} is credited to a query that cannot use it.
+  \item ``Indexes don't help \code{COUNT(*)}'' is wrong by 29x.
+  \item The ``Time Range'' benchmark queries a nonexistent user.
+  \item \file{PROJECT\_WALKTHROUGH.md} makes claims the README carefully does not:
+    ``3x read capacity'', ``200\% increase'', ``70\% reduction in slow queries''.
+    \textbf{Nothing in the repository measures read throughput at all}; no load was ever
+    driven at the replicas. Two documents describing the same project at different
+    confidence levels is itself a liability.
+\end{enumerate}
+
+\subsection{What it gets right, and it is the important part}
+
+\begin{keyidea}{It kept a negative result}
+Partitioning made a query 70\% slower. The author wrote it down, explained it, and drew
+the correct general conclusion: \emph{partitioning is a bet on your access pattern, and
+the key choice is really a choice about which queries you are willing to make slower.}
+That is the best sentence in the repository and it is true.
+
+Alongside it: the conclusion that block counts from \code{EXPLAIN (BUFFERS)} are a
+steadier comparison than wall-clock milliseconds, reached independently and correct; the
+recognition that a first-touch scan is also setting hint bits and writing blocks back
+out, so a single sample of it is not a benchmark; and a README that states its own
+verification gaps rather than implying a live multi-node run happened.
+
+Most portfolio projects report only wins. The defects listed above are all fixable in an
+afternoon and several belong to the course scaffolding rather than the author. The
+instinct to publish the loss is not teachable and is worth more than any of them.
+\end{keyidea}
+
+\subsection{Highest-value repairs}
+
+\begin{enumerate}
+  \item Fix the credential sentence; template \code{primary\_conninfo} at boot. Ten
+    minutes.
+  \item Requalify the 9,154 claim to ``sixteen partitions pruned to one,
+    \code{Subplans Removed: 15}''. Fifteen minutes, and it becomes reproducible.
+  \item Generate partitions from the data (\code{DO} block or \code{pg\_partman}) so the
+    weekly half of the design works again.
+  \item \code{setval()} after migration; decide explicitly on
+    \code{PRIMARY KEY (id, event\_time)} and comment why it is forced.
+  \item Make the tests poll with a timeout so 5/5 means something.
+  \item Reconcile or delete \file{PROJECT\_WALKTHROUGH.md}.
+\end{enumerate}
+
+% =====================================================================
+\section{Glossary}
+
+\begin{description}[leftmargin=!, labelwidth=3.4cm, font=\bfseries\color{inkblue}]
+  \item[Block (page)] The 8~KB unit of I/O. PostgreSQL never reads half of one. Block
+    counts are the honest measure of query work; milliseconds move with cache warmth.
+  \item[Heap] The unordered file holding a table's rows.
+  \item[Sequential scan] Read every block, test every row. Costs the same whether one
+    row matches or all of them.
+  \item[Index] A separate sorted structure mapping values to row locations. Not free:
+    every write must update every index on the table.
+  \item[B-tree] The default index. A shallow balanced tree, so a lookup is a handful of
+    block reads instead of thousands.
+  \item[GIN] Generalized Inverted Index. Maps one \emph{component} to many rows.
+    The right structure when one row contains many searchable things (trigrams, JSON
+    keys). Returns candidates that must be re-checked.
+  \item[Operator class] The rulebook telling an index how to compare values, and
+    therefore which operators it can answer. \code{text\_pattern\_ops} is one.
+  \item[pg\_trgm / trigram] Extension that chops strings into three-character slices so
+    GIN can serve \code{LIKE '\%x\%'} and \code{ILIKE}.
+  \item[JSONB / \code{@>}] Binary JSON column type; \code{@>} is ``contains'', the
+    operator GIN can accelerate.
+  \item[Query planner] Picks the strategy by estimating costs from statistics. It can
+    rationally refuse to use your index, and it can be wrong.
+  \item[ANALYZE] Refreshes the planner's statistics. Its absence is the most likely
+    explanation for this project's unreproducible headline number.
+  \item[Index Only Scan] Answering entirely from an index without touching the heap.
+    Requires an up-to-date visibility map, which is maintained by \code{VACUUM}.
+  \item[Selectivity] The fraction of rows a predicate matches. Not the number of
+    distinct values in the column. Confusing the two is the root of this project's
+    status-index error.
+  \item[EXPLAIN (ANALYZE, BUFFERS)] Run the query and report the real plan, real row
+    counts, real timings and blocks touched. The core skill part 1 teaches.
+  \item[Hint bit] A per-row note of whether its creating transaction committed. The first
+    reader sets it, which is why a first-touch scan is also a large write and why a
+    single sample of it is not a benchmark.
+  \item[Partitioning / partition key] Splitting a table into physical children by a rule
+    on a column. The key is the column the rule uses.
+  \item[Partition pruning] The planner proving a partition cannot match and skipping it.
+    Visible as \code{Subplans Removed: N}.
+  \item[WAL] Write-Ahead Log. Every change is logged before data is touched, for crash
+    safety. Replication is crash recovery aimed at another machine.
+  \item[Primary / replica] The primary takes writes; replicas stream and replay its WAL
+    and serve read-only queries.
+  \item[Async replication] The primary does not wait for replicas before confirming a
+    commit. Fast; reads can be stale.
+  \item[Replication slot] The primary's promise not to recycle WAL a named replica has
+    not consumed yet.
+  \item[pg\_basebackup] Byte-level physical copy of a whole data directory; how a replica
+    gets its starting point. \code{-R} writes the standby config so the copy comes up as
+    a replica.
+  \item[DSN] Connection string packing host, port, database, user and password into one
+    URL.
+  \item[Write amplification] One logical write becoming many physical ones, because every
+    index must be updated too. The unmeasured cost of part 1.
+\end{description}
+
+\vspace{1em}
+\hrule
+\vspace{0.6cm}
+
+\begin{keyidea}{The one-paragraph answer}
+A CTO wanted to migrate to NoSQL because queries were slow. This project works through
+the standard PostgreSQL toolbox instead. The right index turns a 2,494-block sequential
+scan into a 4-block lookup, but only if you pick the right operator class: a default
+B-tree cannot answer a prefix match, a substring match, or a JSON containment query at
+all. Partitioning then reorganizes a time-series table so a March query touches only
+March, verified by the planner pruning fifteen of sixteen partitions; but it is a bet on
+the access pattern, and a query filtering on anything except the partition key gets
+slower, which this project measured and kept. Finally, streaming replication adds read
+capacity by shipping the write-ahead log to two copies, and pushes consistency into the
+application: reads can now be stale, so the app owns routing and the tests own the lag.
+None of it required leaving PostgreSQL.
+\end{keyidea}
+
+\end{document}
